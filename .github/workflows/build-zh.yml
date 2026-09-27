@@ -1,0 +1,267 @@
+name: Build Eagle 简体中文版
+
+# Clones upstream Eagle at a pinned ref, re-derives the localization patch against that
+# exact checkout, drops in l10n/zh-Hans.lproj, then runs upstream's own ipabuild.sh.
+#
+# Re-deriving the patch instead of applying the committed one is deliberate: tools/make_patch.py
+# fails loudly if upstream moved the anchors, whereas a stale committed .patch could apply to
+# the wrong place and produce a binary that silently still says "no Chinese".
+#
+# The output is ad-hoc signed by upstream's script and must be re-signed by your sideloading
+# tool (TrollStore / Sideloadly / ESign) like the official Eagle IPA already is.
+#
+# AGPL-3.0: publishing the IPA obliges you to publish the corresponding source -- this repo
+# plus the pinned upstream ref is that source.
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "Eagle tag, branch or commit to build"
+        type: string
+        default: "v1.0.5"
+      runner:
+        description: "macOS runner image"
+        type: choice
+        options: [macos-26, macos-26-arm64]
+        default: macos-26
+      xcode:
+        description: "Xcode version under /Applications (blank = image default)"
+        type: string
+        default: "26.6"
+      make_release:
+        description: "Also publish a GitHub Release for this build"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-zh-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UPSTREAM: https://github.com/leonardob8777-bit/Eagle
+  WORK: ${{ github.workspace }}/eagle
+
+jobs:
+  build:
+    name: macOS ${{ inputs.runner }} · ${{ inputs.upstream_ref }}
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 60
+    outputs:
+      app_version: ${{ steps.version.outputs.app_version }}
+      app_build: ${{ steps.version.outputs.app_build }}
+
+    steps:
+      - name: Check out Eagle-zh
+        uses: actions/checkout@v4
+
+      - name: Check out upstream Eagle at ${{ inputs.upstream_ref }}
+        run: |
+          git init --quiet "$WORK"
+          git -C "$WORK" remote add origin "$UPSTREAM"
+          # A shallow fetch of the exact object accepts tags and branches; a bare SHA works
+          # too as long as it is reachable from a ref on the default remote.
+          git -C "$WORK" fetch --depth 1 origin "${{ inputs.upstream_ref }}"
+          git -C "$WORK" checkout --quiet --detach FETCH_HEAD
+          git -C "$WORK" log -1 --format='built from %H %ad %s' --date=short
+
+      - name: Select Xcode
+        if: ${{ inputs.xcode != '' }}
+        run: sudo xcode-select -s "/Applications/Xcode_${{ inputs.xcode }}.app"
+
+      - name: Preflight the toolchain
+        run: |
+          xcodebuild -version
+          SDK=$(xcrun --sdk iphoneos --show-sdk-version)
+          SDK_NAME=$(xcrun --sdk iphoneos --show-sdk-platform-version)/$SDK
+          echo "iphoneos SDK: $SDK ($SDK_NAME)"
+          clang --version | head -1
+
+          # Eagle 1.0.5 was built with Xcode 26.6 (its bundle records toolsVersion 17F113 and
+          # DTSDKName iphoneos26.5). Older images default to Xcode 16.4 and top out at the
+          # 26.2 SDK, which fails deep inside xcodebuild with a bare exit code 65 -- catch it here.
+          if [ "$(printf '%s\n26.5\n' "$SDK" | sort -V | head -1)" != "26.5" ]; then
+            echo "::error::iphoneos SDK is $SDK but this project needs >= 26.5."
+            echo "Pick a runner/Xcode pair that ships the 26.5 SDK (macos-26 + 26.6)."
+            exit 1
+          fi
+
+          # The project ships no shared scheme, so -scheme lara relies on Xcode's generated
+          # one. Prove it resolves before spending minutes on a build that cannot start.
+          xcodebuild -project "$WORK/lara.xcodeproj" -list -json | tee "$RUNNER_TEMP/schemes.json"
+          grep -q '"lara"' "$RUNNER_TEMP/schemes.json" || {
+            echo "::error::scheme 'lara' not found in lara.xcodeproj" >&2
+            exit 1
+          }
+
+      - name: Re-derive and apply the Chinese localization patch
+        run: |
+          python3 tools/make_patch.py --repo "$WORK" --out "$RUNNER_TEMP/eagle-zh.patch"
+          git -C "$WORK" apply --check -p1 "$RUNNER_TEMP/eagle-zh.patch"
+          git -C "$WORK" apply -p1 "$RUNNER_TEMP/eagle-zh.patch"
+          git -C "$WORK" --no-pager diff --stat
+
+      - name: Install zh-Hans.lproj into the source tree
+        run: |
+          # The xcodeproj is objectVersion 77 (PBXFileSystemSynchronizedRootGroup), so a new
+          # folder under lara/ is picked up by the build without project edits.
+          cp -R l10n/zh-Hans.lproj "$WORK/lara/zh-Hans.lproj"
+          test -f "$WORK/lara/zh-Hans.lproj/Localizable.strings"
+          test -f "$WORK/lara/zh-Hans.lproj/InfoPlist.strings"
+          grep -q 'zh-Hans' "$WORK/lara.xcodeproj/project.pbxproj" || {
+            echo "knownRegions does not list zh-Hans" >&2; exit 1; }
+          # Deterministic proof that the code half of the patch is in the tree that is about to
+          # be compiled. Grep the source, not the binary -- see the note above the build step.
+          grep -q 'case simplifiedChinese' "$WORK/lara/config/LaraLanguage.swift" || {
+            echo "LaraLanguage.swift has no simplifiedChinese case" >&2; exit 1; }
+          grep -q 'struct L10nText' "$WORK/lara/config/LaraLanguage.swift" || {
+            echo "LaraLanguage.swift has no L10nText; interpolated copy would stay untranslated" >&2
+            exit 1; }
+          # The restored 3-app-limit bypass entry: a dropped hunk here would compile fine and
+          # silently ship a build without the feature, so assert it landed.
+          grep -q 'threeAppBypassTool' "$WORK/lara/views/new/LaraHomeView.swift" || {
+            echo "LaraHomeView.swift has no threeAppBypassTool entry point" >&2; exit 1; }
+          echo "patched source: $(grep -ro 'L10nText(' "$WORK/lara" --include=*.swift | wc -l) wrapped call sites"
+
+      - name: Build
+        run: |
+          bash "$WORK/ipabuild.sh"
+          test -f "$WORK/build/Eagle.ipa"
+
+      - name: Surface the build log when the build fails
+        if: ${{ failure() }}
+        run: |
+          LOG="$WORK/build/xcodebuild.log"
+          if [ -f "$LOG" ]; then
+            echo "=== error lines ==="
+            grep -nE "error:|fatal|The following build commands failed" "$LOG" | head -40 || true
+            echo "=== last 80 lines ==="
+            tail -80 "$LOG"
+            cp "$LOG" "$GITHUB_WORKSPACE/out/xcodebuild.log" 2>/dev/null \
+              || { mkdir -p "$GITHUB_WORKSPACE/out"; cp "$LOG" "$GITHUB_WORKSPACE/out/xcodebuild.log"; }
+          else
+            echo "no xcodebuild.log produced -- the failure happened before xcodebuild ran"
+          fi
+
+      - name: Upload the build log
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log
+          path: out/xcodebuild.log
+          if-no-files-found: ignore
+
+      - name: Verify the Chinese resources landed in the built bundle
+        run: |
+          APP="$WORK/build/DerivedData/Build/Products/Release-iphoneos/Eagle.app"
+          ZH="$APP/zh-Hans.lproj/Localizable.strings"
+          test -d "$APP/zh-Hans.lproj" || { echo "bundle has no zh-Hans.lproj" >&2; exit 1; }
+          test -f "$ZH" || { echo "built app is missing Localizable.strings" >&2; exit 1; }
+
+          python3 - "$APP" <<'PY'
+          import os, plistlib, re, sys
+          app = sys.argv[1]
+
+          def strings_table(p):
+              raw = open(p, "rb").read()
+              if raw.startswith(b"bplist00"):
+                  return plistlib.loads(raw)
+              pairs = re.compile(r'"((?:[^"\\]|\\.)*)"\s*=\s*"((?:[^"\\]|\\.)*)"\s*;')
+              return {k: v for k, v in pairs.findall(raw.decode("utf-8-sig"))}
+
+          zh = strings_table(os.path.join(app, "zh-Hans.lproj", "Localizable.strings"))
+          info = strings_table(os.path.join(app, "zh-Hans.lproj", "InfoPlist.strings"))
+          en = strings_table(os.path.join(app, "en.lproj", "Localizable.strings"))
+
+          cjk = sum(1 for v in zh.values() if re.search(r"[\u4e00-\u9fff]", v))
+          print(f"zh-Hans Localizable.strings .. {len(zh)} entries, {cjk} containing Chinese")
+          print(f"zh-Hans InfoPlist.strings .... {info}")
+          print(f"en.lproj (untouched) ......... {len(en)} entries")
+
+          problems = []
+          if len(zh) < 800:
+              problems.append(f"only {len(zh)} entries made it into the bundle")
+          if cjk < 800:
+              problems.append(f"only {cjk} entries contain Chinese text")
+          if info.get("CFBundleDisplayName") != "Eagle中文":
+              problems.append(f"CFBundleDisplayName is {info.get('CFBundleDisplayName')!r}")
+          if problems:
+              sys.exit("\n".join("  " + p for p in problems))
+          PY
+
+      # No "is the patch in the binary" check here. Two attempts at it were both wrong --
+      # a symbol name disappears when Swift inlines it, and a string literal may not exist as a
+      # contiguous byte run at all (Swift's small-string optimisation packs short literals into
+      # the instruction stream; `English` cannot be found in the published binary in either
+      # encoding). The step above that reads the built bundle's zh-Hans.lproj is the check that
+      # actually proves the resources shipped; whether the code consults them is settled on the
+      # device, not by grepping a Mach-O.
+
+      - name: Name the IPA after the app's own version
+        id: version
+        run: |
+          PL="$WORK/build/DerivedData/Build/Products/Release-iphoneos/Eagle.app/Info.plist"
+          VER=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$PL")
+          BLD=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$PL")
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cp "$WORK/build/Eagle.ipa" "$GITHUB_WORKSPACE/out/Eagle-${VER}-${BLD}-zh-Hans.ipa"
+          {
+            echo "app_version=$VER"
+            echo "app_build=$BLD"
+          } >> "$GITHUB_OUTPUT"
+          echo "built Eagle $VER ($BLD)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: eagle-zh-ipa
+          path: out/*.ipa
+          if-no-files-found: error
+
+      - name: Package the patch and table for re-signing elsewhere
+        uses: actions/upload-artifact@v4
+        with:
+          name: zh-Hans-source-bundle
+          path: |
+            l10n
+            patch
+            tools
+          if-no-files-found: error
+
+  # A step cannot carry its own `permissions` -- GitHub rejects the run at startup -- so the
+  # release lives in its own job and only this job gets write access.
+  release:
+    name: Publish release
+    needs: build
+    if: ${{ inputs.make_release }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: eagle-zh-ipa
+          path: out
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: zh-${{ inputs.upstream_ref }}-${{ github.run_number }}
+          name: Eagle ${{ needs.build.outputs.app_version }} (${{ needs.build.outputs.app_build }}) 简体中文版
+          files: out/*.ipa
+          body: |
+            基于上游 Eagle ${{ needs.build.outputs.app_version }}
+            (${{ needs.build.outputs.app_build }}) 构建的简体中文版。
+
+            - 应用内语言菜单新增「简体中文」，与 English / Español 并列，直接切换即可，
+              **不需要改系统语言**。
+            - 主页新增「3 应用限制绕过」入口：上游 1.0.5 保留了这个页面但摘掉了它的入口，
+              本版把它接了回来。按钮在沙盒越狱就绪前是灰的。
+
+            产物由 `${{ github.workflow }}` 生成，**ad-hoc 签名**，安装前需用
+            TrollStore / Sideloadly / ESign 等工具重签。
+
+            AGPL-3.0：对应源码即本仓库 `l10n/` + `patch/` + 上面引用的上游提交。

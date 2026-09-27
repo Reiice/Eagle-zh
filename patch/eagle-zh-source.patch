@@ -1,0 +1,319 @@
+--- a/lara.xcodeproj/project.pbxproj
++++ b/lara.xcodeproj/project.pbxproj
+@@ -303,6 +303,7 @@
+ 			knownRegions = (
+ 				en,
+ 				es,
++				zh-Hans,
+ 				Base,
+ 			);
+ 			mainGroup = CC1C8B302F71DF9C00206982;
+
+--- a/lara/classes/EagleSceneAuraExecutor.swift
++++ b/lara/classes/EagleSceneAuraExecutor.swift
+@@ -338,7 +338,7 @@
+         EagleSceneComponentResult(
+             component: component,
+             state: state,
+-            detail: LaraL10n.text(en: en, es: es)
++            detail: LaraL10n.text(en: L10nText(en), es: L10nText(es))
+         )
+     }
+ 
+
+--- a/lara/config/LaraLanguage.swift
++++ b/lara/config/LaraLanguage.swift
+@@ -3,6 +3,7 @@
+ nonisolated enum LaraLanguage: String, CaseIterable, Identifiable {
+     case english = "en"
+     case spanish = "es"
++    case simplifiedChinese = "zh-Hans"
+ 
+     static let storageKey = "lara.interfaceLanguage"
+ 
+@@ -16,6 +17,7 @@
+         switch self {
+         case .english: return "English"
+         case .spanish: return "Español"
++        case .simplifiedChinese: return "简体中文"
+         }
+     }
+ 
+@@ -23,6 +25,71 @@
+         switch self {
+         case .english: return "EN"
+         case .spanish: return "ES"
++        case .simplifiedChinese: return "中文"
++        }
++    }
++}
++
++/// A text template plus the values interpolated into it.
++///
++/// Capturing the template is what makes `LaraL10n.text(en: "Found \\(n) paths", ...)`
++/// localizable: as a plain String the number is already baked in, so no static table key could
++/// ever match. Each interpolation becomes `%@` carrying a pre-rendered string, which keeps the
++/// English and Spanish result identical to Swift's own interpolation.
++nonisolated struct L10nText: ExpressibleByStringLiteral, ExpressibleByStringInterpolation {
++    typealias StringInterpolation = Interpolation
++
++    let template: String
++    let values: [String]
++
++    init(stringLiteral value: String) {
++        template = value
++        values = []
++    }
++
++    init(_ value: String) {
++        template = value
++        values = []
++    }
++
++    init(stringInterpolation: Interpolation) {
++        template = stringInterpolation.template
++        values = stringInterpolation.values
++    }
++
++    var string: String { render(template) }
++
++    /// Substitutes the captured values positionally, so a translation may reorder `%@`.
++    func render(_ template: String) -> String {
++        guard !values.isEmpty else { return template }
++        var out = ""
++        var rest = template
++        var index = 0
++        while let range = rest.range(of: "%@") {
++            out += rest[..<range.lowerBound]
++            out += index < values.count ? values[index] : ""
++            index += 1
++            rest = String(rest[range.upperBound...])
++        }
++        return out + rest
++    }
++
++    struct Interpolation: StringInterpolationProtocol {
++        var template = ""
++        var values: [String] = []
++
++        init(literalCapacity: Int, interpolationCount: Int) {
++            template.reserveCapacity(literalCapacity)
++            values.reserveCapacity(interpolationCount)
++        }
++
++        mutating func appendLiteral(_ literal: String) {
++            template += literal
++        }
++
++        mutating func appendInterpolation(_ value: Any?) {
++            template += "%@"
++            values.append((value as? String) ?? String(describing: value))
+         }
+     }
+ }
+@@ -38,20 +105,55 @@
+         return language
+     }
+ 
+-    static func text(en: String, es: String) -> String {
+-        language == .spanish ? es : en
++    /// Resolved by path, not by device language: choosing 简体中文 has to work on an English
++    /// device, and choosing English must not pick up Chinese from a Chinese device.
++    private static let chineseBundle: Bundle? = {
++        guard let path = Bundle.main.path(forResource: "zh-Hans", ofType: "lproj") else {
++            return nil
++        }
++        return Bundle(path: path)
++    }()
++
++    private static let missingMarker = "\u{0}\u{0}missing"
++
++    static func text(en: L10nText, es: L10nText) -> String {
++        switch language {
++        case .english:
++            return en.string
++        case .spanish:
++            return es.string
++        case .simplifiedChinese:
++            // The table is keyed by whichever source form the developer wrote, so try the
++            // English template first and fall back to the Spanish one.
++            if let hit = chinese(en.template) { return en.render(hit) }
++            if let hit = chinese(es.template) { return es.render(hit) }
++            return en.string
++        }
+     }
+ 
+     static func localized(_ key: String) -> String {
+-        if language == .spanish {
++        switch language {
++        case .spanish:
+             return key
++        case .simplifiedChinese:
++            return chinese(key) ?? key
++        case .english:
++            guard
++                let path = Bundle.main.path(forResource: language.rawValue, ofType: "lproj"),
++                let bundle = Bundle(path: path)
++            else {
++                return key
++            }
++            return bundle.localizedString(forKey: key, value: key, table: nil)
+         }
+-        guard
+-            let path = Bundle.main.path(forResource: language.rawValue, ofType: "lproj"),
+-            let bundle = Bundle(path: path)
+-        else {
+-            return key
+-        }
+-        return bundle.localizedString(forKey: key, value: key, table: nil)
++    }
++
++    /// nil when nothing is translated, so callers fall back to the source text instead of
++    /// rendering an empty label.
++    private static func chinese(_ key: String) -> String? {
++        guard let bundle = chineseBundle else { return nil }
++        let value = bundle.localizedString(forKey: key, value: missingMarker, table: nil)
++        guard value != missingMarker, !value.isEmpty, value != key else { return nil }
++        return value
+     }
+ }
+
+--- a/lara/views/new/AuraStudioView.swift
++++ b/lara/views/new/AuraStudioView.swift
+@@ -239,7 +239,7 @@
+     let spanishName: String
+ 
+     var localizedName: String {
+-        LaraL10n.text(en: englishName, es: spanishName)
++        LaraL10n.text(en: L10nText(englishName), es: L10nText(spanishName))
+     }
+ }
+ 
+
+--- a/lara/views/new/DockGalleryView.swift
++++ b/lara/views/new/DockGalleryView.swift
+@@ -128,8 +128,8 @@
+     let width: Int
+     let height: Int
+ 
+-    var localizedTitle: String { LaraL10n.text(en: title, es: titleES) }
+-    var localizedSubtitle: String { LaraL10n.text(en: subtitle, es: subtitleES) }
++    var localizedTitle: String { LaraL10n.text(en: L10nText(title), es: L10nText(titleES)) }
++    var localizedSubtitle: String { LaraL10n.text(en: L10nText(subtitle), es: L10nText(subtitleES)) }
+     var presentationPreviewURL: URL {
+         let source = frameCount > 1 ? (animatedPreviewURL ?? previewURL) : previewURL
+         var components = URLComponents(url: source, resolvingAgainstBaseURL: false)
+@@ -557,7 +557,7 @@
+     private func failure(en: String, es: String) -> DockGalleryApplyResult {
+         DockGalleryApplyResult(
+             succeeded: false,
+-            message: LaraL10n.text(en: en, es: es)
++            message: LaraL10n.text(en: L10nText(en), es: L10nText(es))
+         )
+     }
+ 
+
+--- a/lara/views/new/GalleryPositionControl.swift
++++ b/lara/views/new/GalleryPositionControl.swift
+@@ -166,7 +166,7 @@
+                     in: RoundedRectangle(cornerRadius: 12)
+                 )
+         }
+-        .accessibilityLabel(LaraL10n.text(en: en, es: es))
++        .accessibilityLabel(LaraL10n.text(en: L10nText(en), es: L10nText(es)))
+         .accessibilityIdentifier("gallery-position-\(symbol)")
+         .disabled(
+             (dx != 0 && GalleryPosition.component(x + dx * step) ==
+
+--- a/lara/views/new/HideDockIslandView.swift
++++ b/lara/views/new/HideDockIslandView.swift
+@@ -116,7 +116,7 @@
+     }
+ 
+     private func failure(en: String, es: String) -> EagleDockBackgroundResult {
+-        EagleDockBackgroundResult(succeeded: false, message: LaraL10n.text(en: en, es: es))
++        EagleDockBackgroundResult(succeeded: false, message: LaraL10n.text(en: L10nText(en), es: L10nText(es)))
+     }
+ 
+     private func refreshDiskState() {
+
+--- a/lara/views/new/HomeLabelColorView.swift
++++ b/lara/views/new/HomeLabelColorView.swift
+@@ -14,7 +14,7 @@
+     let color: Color
+ 
+     var title: String {
+-        LaraL10n.text(en: englishName, es: spanishName)
++        LaraL10n.text(en: L10nText(englishName), es: L10nText(spanishName))
+     }
+ 
+     static let all: [HomeLabelColorPreset] = [
+
+--- a/lara/views/new/IslandGalleryPresentation.swift
++++ b/lara/views/new/IslandGalleryPresentation.swift
+@@ -8,7 +8,7 @@
+     var id: String { liveTheme?.id ?? (style == .singularityLive ? "singularity-live" : "island-\(style.rawValue)") }
+     var isRemote: Bool { style == .singularityLive }
+     var isLive: Bool { isRemote && (liveTheme?.isAnimated ?? true) }
+-    var title: String { liveTheme.map { LaraL10n.text(en: $0.title, es: $0.titleES) } ?? style.title }
++    var title: String { liveTheme.map { LaraL10n.text(en: L10nText($0.title), es: L10nText($0.titleES)) } ?? style.title }
+     var subtitle: String {
+         if isLive { return LaraL10n.text(en: "Art in motion. Made for your Island.", es: "Arte en movimiento. Hecho para tu isla.") }
+         if isRemote { return LaraL10n.text(en: "Still art for your Island.", es: "Arte fijo para tu isla.") }
+
+--- a/lara/views/new/IslandGalleryView.swift
++++ b/lara/views/new/IslandGalleryView.swift
+@@ -410,7 +410,7 @@
+             liveTheme: liveTheme,
+             shadowIntensity: Double(requestedShadowIntensity) / 100.0
+         )
+-        let title = liveTheme.map { LaraL10n.text(en: $0.title, es: $0.titleES) } ?? style.title
++        let title = liveTheme.map { LaraL10n.text(en: L10nText($0.title), es: L10nText($0.titleES)) } ?? style.title
+         if style == .singularityLive && UIAccessibility.isReduceMotionEnabled {
+             return IslandGalleryApplyResult(
+                 succeeded: true,
+@@ -498,7 +498,7 @@
+     private func failure(en: String, es: String) -> IslandGalleryApplyResult {
+         IslandGalleryApplyResult(
+             succeeded: false,
+-            message: LaraL10n.text(en: en, es: es)
++            message: LaraL10n.text(en: L10nText(en), es: L10nText(es))
+         )
+     }
+ 
+
+--- a/lara/views/new/LaraHomeView.swift
++++ b/lara/views/new/LaraHomeView.swift
+@@ -30,6 +30,7 @@
+                     if EagleFeaturePolicy.allows(.advancedSystemTools, channel: currentChannel) {
+                         laboratoryTools
+                     }
++                    threeAppBypassTool
+ 
+                     if normalizedToolQuery.isEmpty {
+                         VStack(alignment: .leading, spacing: 20) {
+@@ -245,6 +246,24 @@
+         EagleHeaderBar(language: $language) {
+             showingSettings = true
+         }
++    }
++
++    private var threeAppBypassTool: some View {
++        NavigationLink(destination: AppsView().environmentObject(mgr)) {
++            LaraToolRow(
++                title: LaraL10n.localized("3 App Bypass"),
++                subtitle: LaraL10n.localized(
++                    "Needs to be reapplied everytime you sideload a new app."
++                ),
++                systemImage: "app.badge",
++                accent: .orange
++            )
++        }
++        .disabled(!mgr.sbxready)
++        .buttonStyle(.plain)
++        .background(Color(uiColor: .secondarySystemGroupedBackground),
++                    in: RoundedRectangle(cornerRadius: 22, style: .continuous))
++        .accessibilityIdentifier("three-app-bypass")
+     }
+ 
+     private var laboratoryTools: some View {

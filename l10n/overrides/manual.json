@@ -1,0 +1,15 @@
+{
+ "Delete %@?": "删除“%@”？",
+ "Delete %d matched path%@?": "删除 %d 个匹配路径？",
+ "Emojis — %@": "表情符号 — %@",
+ "Native result: %@": "原生结果：%@",
+ "Example: \n%@": "示例：\n%@",
+ "Original (%d)": "原始 (%d)",
+ "%@ está listo": "%@ 已就绪",
+ "%@ is ready": "%@ 已就绪",
+ "%@ se aplicó y verificó con su halo %@.": "%@ 已应用并通过验证，光晕为 %@。",
+ "%@ was applied and verified with its %@ halo.": "%@ 已应用并通过验证，光晕为 %@。",
+ "Step %@ of %@": "第 %@ 步，共 %@",
+ "Tu composición %@": "你的%@混搭",
+ "Your %@ composition": "你的%@混搭"
+}

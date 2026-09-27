@@ -1,0 +1,5 @@
+/* Eagle — 简体中文 */
+/* 2 strings */
+
+"CFBundleDisplayName" = "Eagle中文";
+"NSMicrophoneUsageDescription" = "Eagle 会采集一段四秒的音频样本，在本地生成视觉作品，随后删除该录音。";

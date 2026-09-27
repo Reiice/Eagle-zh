@@ -1,0 +1,26 @@
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editors
+.idea/
+.vscode/
+*.swp
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Build output / deps (按实际技术栈收敛)
+node_modules/
+dist/
+build/
+__pycache__/
+*.pyc
+.venv/
+
+# 上游源码 checkout、ipa 解包结果、提取出的中间表 —— 全部可由 tools/ 重新生成
+work/
+*.ipa
